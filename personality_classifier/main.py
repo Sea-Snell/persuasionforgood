@@ -132,7 +132,7 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     info_path = '../data/FullData/full_info.csv'
     dialogue_path = '../data/FullData/full_dialog.csv'
-    persona_path = '../personachat/personachat_truecased/personachat_truecased_full_train.json'
+    persona_path = '../personachat_truecased/personachat_truecased_full_train.json'
     bsize = 256
     emb_dim = 768
     h_dim = 256
