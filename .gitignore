@@ -1,2 +1,5 @@
 personachat/
 .DS_Store
+glove/
+wandb/
+personachat_truecased/
