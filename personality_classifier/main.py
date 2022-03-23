@@ -24,6 +24,9 @@ def big5tolist(x):
 def uniform_descretize_big5(list_big5, min_big5, max_big5, n_discrete):
     return [int(math.ceil(((item-min_big5)*n_discrete)/(max_big5-min_big5)))-1 for item in list_big5]
 
+def expected_value_discrete_big5(probs, min_big5, max_big5):
+    return sum([(min_big5+(max_big5-min_big5)*(i/(len(probs)-1)))*p for i, p in enumerate(probs)])
+
 def tokenize_glove(spacy_tokenizer, tok2idx, text):
     text = text.lower()
     toks = [item.text for item in spacy_tokenizer(text)]
@@ -167,7 +170,7 @@ class DiscretePersonalityClassifier(nn.Module):
             e = predictions.entropy().sum(dim=1)
             entropy += e.mean().item() * tokens.shape[0]
             p = predictions.probs
-            entropies.extend([(e[i].item(), tokens[i], p[i].detach().cpu().tolist(),) for i in range(tokens.shape[0])])
+            entropies.extend([(e[i].item(), tokens[i], p[i].detach().cpu().tolist(), classes[i]) for i in range(tokens.shape[0])])
             entropy_std += e.std().item() * tokens.shape[0]
             total += tokens.shape[0]
         logs = {'loss': loss / total, 
@@ -175,14 +178,14 @@ class DiscretePersonalityClassifier(nn.Module):
                 'entropy_std': entropy_std / total}
         entropies = sorted(entropies, key=lambda x: x[0])
         top_k_ents = entropies[-self.k:]
-        top_k_ents = [(x[0], self.detokenizer(x[1][:(x[1] != self.pad_token).long().sum().item()].detach().cpu().tolist()), x[2]) for x in top_k_ents]
+        top_k_ents = [(x[0], self.detokenizer(x[1][:(x[1] != self.pad_token).long().sum().item()].detach().cpu().tolist()), x[2], x[3],) for x in top_k_ents]
         bottom_k_ents = entropies[:self.k]
-        bottom_k_ents = [(x[0], self.detokenizer(x[1][:(x[1] != self.pad_token).long().sum().item()].detach().cpu().tolist()), x[2]) for x in bottom_k_ents]
+        bottom_k_ents = [(x[0], self.detokenizer(x[1][:(x[1] != self.pad_token).long().sum().item()].detach().cpu().tolist()), x[2], x[3],) for x in bottom_k_ents]
         str_ = ''
         str_ += 'top k:\n'
-        str_ += '\n'.join(map(lambda x: str(x[0])+'\n'+('='*25)+'\n'+x[1]+'\n'+str(listtobig5(x[2]))+'\n'+('='*25), top_k_ents))
+        str_ += '\n'.join(map(lambda x: str(x[0])+'\n'+('='*25)+'\n'+x[1]+'\n'+str({k: expected_value_discrete_big5(v, 0, 5) for k, v in listtobig5(x[2]).items()})+'\n'+str({k: 5*(v.item()/(self.n_discrete-1)) for k, v in listtobig5(x[3]).items()})+'\n'+('='*25), top_k_ents))
         str_ += '\nbottom k:\n'
-        str_ += '\n'.join(map(lambda x: str(x[0])+'\n'+('='*25)+'\n'+x[1]+'\n'+str(listtobig5(x[2]))+'\n'+('='*25), bottom_k_ents))
+        str_ += '\n'.join(map(lambda x: str(x[0])+'\n'+('='*25)+'\n'+x[1]+'\n'+str({k: expected_value_discrete_big5(v, 0, 5) for k, v in listtobig5(x[2]).items()})+'\n'+str({k: 5*(v.item()/(self.n_discrete-1)) for k, v in listtobig5(x[3]).items()})+'\n'+('='*25), bottom_k_ents))
         return logs, str_
         
 
@@ -299,7 +302,7 @@ if __name__ == "__main__":
     weight_decay = 0.01
     epochs = 1000
     n_personas = 1
-    use_wandb = False
+    use_wandb = True
     discrete = True
     n_discrete = 10
     emb_kind = 'gpt2'
