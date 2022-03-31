@@ -3,3 +3,4 @@ personachat/
 glove/
 wandb/
 personachat_truecased/
+*.pkl

@@ -4,7 +4,7 @@ from transformers import GPT2Tokenizer, GPT2Model
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 import torch
-from torch.optim import AdamW
+from torch.optim import AdamW, SGD
 from tqdm.auto import tqdm
 import json
 import random
@@ -73,8 +73,9 @@ def initalize_gpt2():
     return lambda x: tokenizer(x)['input_ids'], lambda x: tokenizer.decode(x), gpt2_embs, len(tokenizer), tokenizer.pad_token_id
 
 class PersonalityClassifier(nn.Module):
-    def __init__(self, emb_dim, h_dim, n_tokens, pad_token, init_embs=None):
+    def __init__(self, device, emb_dim, h_dim, n_tokens, pad_token, init_embs=None):
         super().__init__()
+        self.device = device
         self.emb_dim = emb_dim
         self.h_dim = h_dim
         self.n_tokens = n_tokens
@@ -112,7 +113,7 @@ class PersonalityClassifier(nn.Module):
         std = np.zeros((5,))
         std_std = np.zeros((5,))
         for tokens, classes in data_loader:
-            tokens, classes = tokens.to(device), classes.to(device)
+            tokens, classes = tokens.to(self.device), classes.to(self.device)
             predictions = self(tokens)
             l = -predictions.log_prob(classes).mean()
             loss += l.item() * tokens.shape[0]
@@ -132,8 +133,9 @@ class PersonalityClassifier(nn.Module):
                 'std_std': listtobig5((std_std / total).tolist())}, None
 
 class DiscretePersonalityClassifier(nn.Module):
-    def __init__(self, n_discrete, emb_dim, h_dim, n_tokens, pad_token, detokenizer, k, init_embs=None):
+    def __init__(self, device, n_discrete, emb_dim, h_dim, n_tokens, pad_token, detokenizer, k, init_embs=None):
         super().__init__()
+        self.device = device
         self.n_discrete = n_discrete
         self.emb_dim = emb_dim
         self.h_dim = h_dim
@@ -162,19 +164,47 @@ class DiscretePersonalityClassifier(nn.Module):
         entropy_std = 0.0
         total = 0
         entropies = []
-        for tokens, classes in data_loader:
-            tokens, classes = tokens.to(device), classes.to(device)
+        for tokens, classes in tqdm(data_loader):
+            tokens, classes = tokens.to(self.device), classes.to(self.device)
             predictions = self(tokens)
             l = -predictions.log_prob(classes).mean()
             loss += l.item() * tokens.shape[0]
             e = predictions.entropy().sum(dim=1)
             entropy += e.mean().item() * tokens.shape[0]
             p = predictions.probs
-            entropies.extend([(e[i].item(), tokens[i], p[i].detach().cpu().tolist(), classes[i]) for i in range(tokens.shape[0])])
+            entropies.extend([(e[i].item(), tokens[i], p[i].detach().cpu().tolist(), classes[i], self.compute_saliency(tokens[i].unsqueeze(0), self.k)) for i in range(tokens.shape[0])])
             entropy_std += e.std().item() * tokens.shape[0]
             total += tokens.shape[0]
         logs = {'loss': loss / total, 
                 'entropy': entropy / total, 
+                'entropy_std': entropy_std / total}
+        entropies = sorted(entropies, key=lambda x: x[0])
+        top_k_ents = entropies[-self.k:]
+        top_k_ents = [(x[0], self.detokenizer(x[1][:(x[1] != self.pad_token).long().sum().item()].detach().cpu().tolist()), x[2], x[3], x[4]) for x in top_k_ents]
+        bottom_k_ents = entropies[:self.k]
+        bottom_k_ents = [(x[0], self.detokenizer(x[1][:(x[1] != self.pad_token).long().sum().item()].detach().cpu().tolist()), x[2], x[3], x[4]) for x in bottom_k_ents]
+        str_ = ''
+        str_ += 'top k:\n'
+        str_ += '\n'.join(map(lambda x: str(x[0])+'\n'+('='*25)+'\n'+x[1]+'\n'+str({k: expected_value_discrete_big5(v, 0, 5) for k, v in listtobig5(x[2]).items()})+'\n'+str({k: 5*(v.item()/(self.n_discrete-1)) for k, v in listtobig5(x[3]).items()})+'\n'+str(x[4])+'\n'+('='*25), top_k_ents))
+        str_ += '\nbottom k:\n'
+        str_ += '\n'.join(map(lambda x: str(x[0])+'\n'+('='*25)+'\n'+x[1]+'\n'+str({k: expected_value_discrete_big5(v, 0, 5) for k, v in listtobig5(x[2]).items()})+'\n'+str({k: 5*(v.item()/(self.n_discrete-1)) for k, v in listtobig5(x[3]).items()})+'\n'+str(x[4])+'\n'+('='*25), bottom_k_ents))
+        return logs, str_
+    
+    def eval_personachat(self, persona_dataloader):
+        entropy = 0.0
+        entropy_std = 0.0
+        total = 0
+        entropies = []
+        for tokens in tqdm(persona_dataloader):
+            tokens = tokens.to(self.device)
+            predictions = self(tokens)
+            e = predictions.entropy().sum(dim=1)
+            entropy += e.mean().item() * tokens.shape[0]
+            p = predictions.probs
+            entropies.extend([(e[i].item(), tokens[i], p[i].detach().cpu().tolist(), self.compute_saliency(tokens[i].unsqueeze(0), self.k),) for i in range(tokens.shape[0])])
+            entropy_std += e.std().item() * tokens.shape[0]
+            total += tokens.shape[0]
+        logs = {'entropy': entropy / total, 
                 'entropy_std': entropy_std / total}
         entropies = sorted(entropies, key=lambda x: x[0])
         top_k_ents = entropies[-self.k:]
@@ -183,11 +213,39 @@ class DiscretePersonalityClassifier(nn.Module):
         bottom_k_ents = [(x[0], self.detokenizer(x[1][:(x[1] != self.pad_token).long().sum().item()].detach().cpu().tolist()), x[2], x[3],) for x in bottom_k_ents]
         str_ = ''
         str_ += 'top k:\n'
-        str_ += '\n'.join(map(lambda x: str(x[0])+'\n'+('='*25)+'\n'+x[1]+'\n'+str({k: expected_value_discrete_big5(v, 0, 5) for k, v in listtobig5(x[2]).items()})+'\n'+str({k: 5*(v.item()/(self.n_discrete-1)) for k, v in listtobig5(x[3]).items()})+'\n'+('='*25), top_k_ents))
+        str_ += '\n'.join(map(lambda x: str(x[0])+'\n'+('='*25)+'\n'+x[1]+'\n'+str({k: expected_value_discrete_big5(v, 0, 5) for k, v in listtobig5(x[2]).items()})+'\n'+str(x[3])+'\n'+('='*25), top_k_ents))
         str_ += '\nbottom k:\n'
-        str_ += '\n'.join(map(lambda x: str(x[0])+'\n'+('='*25)+'\n'+x[1]+'\n'+str({k: expected_value_discrete_big5(v, 0, 5) for k, v in listtobig5(x[2]).items()})+'\n'+str({k: 5*(v.item()/(self.n_discrete-1)) for k, v in listtobig5(x[3]).items()})+'\n'+('='*25), bottom_k_ents))
+        str_ += '\n'.join(map(lambda x: str(x[0])+'\n'+('='*25)+'\n'+x[1]+'\n'+str({k: expected_value_discrete_big5(v, 0, 5) for k, v in listtobig5(x[2]).items()})+'\n'+str(x[3])+'\n'+('='*25), bottom_k_ents))
         return logs, str_
-        
+    
+    def compute_saliency(self, tokens, k):
+        original_grad = []
+        for param in self.emb.parameters():
+            original_grad.append((param, param.requires_grad,))
+            param.requires_grad = True
+        assert tokens.shape[0] == 1
+        predictions = self(tokens)
+        frequencies = (tokens.unsqueeze(2) == torch.arange(0, self.emb.weight.data.shape[0]).unsqueeze(0).unsqueeze(0).to(self.device)).float().sum(dim=1)[0]
+        frequencies += (frequencies == 0.0).float()
+        p = predictions.probs[0]
+        e_vals = [expected_value_discrete_big5(item, 0, 5) for item in p]
+        opt = SGD(self.parameters(), lr=0.0, momentum=0.0)
+        saliencies_norm = []
+        saliencies = []
+        for e_val in e_vals:
+            opt.zero_grad()
+            e_val.backward(retain_graph=True)
+            saliency = (self.emb.weight.grad.data * self.emb.weight.data).sum(dim=1)
+            saliency_norm = saliency / frequencies[0]
+            sorted_saliency_norm = torch.argsort(torch.abs(saliency_norm), dim=0)
+            sorted_saliency = torch.argsort(torch.abs(saliency), dim=0)
+            top_saliency_norm = sorted_saliency_norm[-k:].detach().cpu().tolist()
+            top_saliency = sorted_saliency[-k:].detach().cpu().tolist()
+            saliencies_norm.append({self.detokenizer([idx]): saliency_norm[idx].item() for idx in top_saliency_norm})
+            saliencies.append({self.detokenizer([idx]): saliency[idx].item() for idx in top_saliency})
+        for param, required in original_grad:
+            param.requires_grad = required
+        return (listtobig5(saliencies), listtobig5(saliencies_norm),)
 
 class PersuasionData(Dataset):
     def __init__(self, info_path, dialogue_path, tokenizer, pad_token, split, frac_train, discrete, n_discrete) -> None:
@@ -283,6 +341,33 @@ class PersonaChatData(Dataset):
         return len(self.datapoints)
     
     def collate(self, items):
+        _, _, _, tokens = list(zip(*items))
+        tokens = nn.utils.rnn.pad_sequence(list(map(lambda x: torch.tensor(x), tokens)), 
+                                           batch_first=True, 
+                                           padding_value=self.pad_token)
+        return tokens
+
+class EssayData(Dataset):
+    def __init__(self, path, tokenizer, pad_token):
+        self.tokenizer = tokenizer
+        self.pad_token = pad_token
+        with open(path, 'r') as f:
+            data = [{'text': row[1], 'personality': {'extrovert': int(row[2]=='y'), 'agreeable': int(row[4]=='y'), 'conscentious': int(row[5]=='y'), 'neurotic': int(row[3]=='y'), 'open': int(row[6]=='y')}} for row in csv.reader(f)]
+        self.datapoints = [self.prepare_item(item) for item in data]
+    
+    def prepare_item(self, item):
+        text = item['text']
+        tokens = self.tokenizer(text)
+        persona = big5tolist(item['personality'])
+        return text, tokens, persona
+    
+    def __getitem__(self, i):
+        return self.datapoints[i]
+    
+    def __len__(self):
+        return len(self.datapoints)
+    
+    def collate(self, items):
         _, tokens, classes = list(zip(*items))
         tokens = nn.utils.rnn.pad_sequence(list(map(lambda x: torch.tensor(x), tokens)), 
                                            batch_first=True, 
@@ -305,9 +390,10 @@ if __name__ == "__main__":
     use_wandb = True
     discrete = True
     n_discrete = 10
-    emb_kind = 'gpt2'
+    emb_kind = 'glove'
     print_every = 100
     k = 5
+    save_checkpoint = './glove_model.pkl'
 
     if use_wandb:
         wandb.init(project='personality_classifier')
@@ -319,24 +405,14 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
     if not discrete:
-        model = PersonalityClassifier(emb_dim, h_dim, n_toks, padding, embs).to(device)
+        model = PersonalityClassifier(device, emb_dim, h_dim, n_toks, padding, embs).to(device)
     else:
-        model = DiscretePersonalityClassifier(n_discrete, emb_dim, h_dim, n_toks, padding, decoder, k, embs).to(device)
+        model = DiscretePersonalityClassifier(device, n_discrete, emb_dim, h_dim, n_toks, padding, decoder, k, embs).to(device)
     train_dataset = PersuasionData(info_path, dialogue_path, tokenizer, padding, 'train', 0.75, discrete, n_discrete)
     eval_dataset = PersuasionData(info_path, dialogue_path, tokenizer, padding, 'eval', 0.75, discrete, n_discrete)
-    # persona_dataset = PersonaChatData(persona_path, tokenizer, padding)
     train_data_loader = DataLoader(train_dataset, batch_size=bsize, shuffle=True, collate_fn=train_dataset.collate)
     eval_data_loader = DataLoader(eval_dataset, batch_size=bsize, shuffle=True, collate_fn=eval_dataset.collate)
     optim = AdamW(model.parameters(), lr, weight_decay=weight_decay)
-
-    # all_classes = []
-    # for _, _, classes in PersuasionData(info_path, dialogue_path, tokenizer, padding, 'train', 1.0):
-    #     all_classes.append(classes)
-    # all_classes = np.array(all_classes)
-    # dataset_avg = np.mean(all_classes, axis=0)
-    # dataset_std = np.std(all_classes, axis=0)
-    # print('dataset average:', listtobig5(dataset_avg.tolist()))
-    # print('dataset std:', listtobig5(dataset_std.tolist()))
 
     for epoch in range(epochs):
         for tokens, classes in tqdm(train_data_loader):
@@ -364,18 +440,6 @@ if __name__ == "__main__":
                 print('='*25)
                 print(eval_print_out)
                 print('='*25)
-
-        # persona_matches = []
-        # for idx in random.sample(range(len(persona_dataset)), n_personas):
-        #     persona, persona_tokens, text, tokens = persona_dataset[idx]
-        #     tokens, persona_tokens = torch.tensor(tokens).to(device), torch.tensor(persona_tokens).to(device)
-        #     predictions = model(tokens.unsqueeze(0)).loc[0].detach().cpu().tolist()
-        #     persona_predictions = model(persona_tokens.unsqueeze(0)).loc[0].detach().cpu().tolist()
-        #     persona_matches.append({
-        #                             'predictions': listtobig5(predictions), 
-        #                             'persona_predictions': listtobig5(persona_predictions), 
-        #                             'persona': persona, 
-        #                             'utterances': text})
         print('epoch:', epoch)
         results = {'train': train_logs, 
                     'eval': eval_logs, 
@@ -384,6 +448,5 @@ if __name__ == "__main__":
             wandb.log({'epoch': epoch, **results})
         print('train:', results['train'])
         print('eval:', results['eval'])
-        # for match in persona_matches:
-        #     print(match['predictions'], match['persona_predictions'], match['persona'])
+    torch.save(model.state_dict(), save_checkpoint)
 
